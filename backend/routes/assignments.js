@@ -8,13 +8,14 @@ async function getAssignments(req, res) {
     const sortOrder = req.query.sort === 'desc' ? -1 : 1;
     const search = req.query.search || '';
     const hideCompleted = req.query.hideCompleted === 'true';
+    const userId = req.query.userId; // User looking at the list
     const skip = (page - 1) * limit;
 
     try {
         // 1. Build the aggregation pipeline
         const pipeline = [];
 
-        // Search filter (optimization: filter by name early)
+        // Search filter
         if (search) {
             pipeline.push({
                 $match: {
@@ -23,16 +24,42 @@ async function getAssignments(req, res) {
             });
         }
 
-        // Lookup submissions to determine 'rendu' status
-        pipeline.push(
-            {
+        // Lookup submissions to determine 'rendu' status FOR THIS USER
+        // We use a pipeline lookup to filter submissions by userId immediately
+        if (userId) {
+             pipeline.push({
+                $lookup: {
+                    from: 'submissions',
+                    let: { assignmentId: '$_id' },
+                    pipeline: [
+                        { 
+                            $match: { 
+                                $expr: { 
+                                    $and: [
+                                        { $eq: ['$assignmentId', '$$assignmentId'] },
+                                        { $eq: ['$userId', new mongoose.Types.ObjectId(userId)] }
+                                    ] 
+                                } 
+                            } 
+                        }
+                    ],
+                    as: 'submission'
+                }
+             });
+        } else {
+            // Fallback if no user specified: keeps existing behavior (checks if ANYONE submitted)
+            // Or strictly return false. Keeping "any" for now but likely barely used.
+             pipeline.push({
                 $lookup: {
                     from: 'submissions',
                     localField: '_id',
                     foreignField: 'assignmentId',
                     as: 'submission'
                 }
-            },
+            });
+        }
+
+        pipeline.push(
             {
                 $addFields: {
                     rendu: { $gt: [{ $size: "$submission" }, 0] },
@@ -46,7 +73,7 @@ async function getAssignments(req, res) {
             }
         );
 
-        // Filter by computed 'rendu' field if needed
+        // Filter by computed 'rendu' field
         if (hideCompleted) {
             pipeline.push({
                 $match: {
@@ -62,7 +89,7 @@ async function getAssignments(req, res) {
             }
         });
 
-        // 2. Use $facet to get data and count in parallel
+        // 2. Use $facet
         const facetPipeline = [
             ...pipeline,
             {
@@ -100,15 +127,23 @@ async function getAssignments(req, res) {
 // Get one assignment by _id
 async function getAssignment(req, res) {
     let assignmentId = req.params.id;
+    let userId = req.query.userId; // Also support per-user check here
 
     try {
-        // We can use aggregate for single item too, or find + count
         const assignment = await Assignment.findById(assignmentId).lean();
         if (!assignment) {
             return res.status(404).json({ message: 'Assignment not found' });
         }
 
-        const submission = await Submission.findOne({ assignmentId: assignment._id });
+        // Check submission for this specific user
+        let submission = null;
+        if (userId) {
+             submission = await Submission.findOne({ assignmentId: assignment._id, userId: userId });
+        } else {
+             // Fallback: check if *any* submission exists (old behavior)
+             submission = await Submission.findOne({ assignmentId: assignment._id });
+        }
+        
         assignment.rendu = !!submission;
 
         res.json(assignment);
@@ -122,7 +157,6 @@ async function postAssignment(req, res) {
     let assignment = new Assignment();
     assignment.nom = req.body.nom;
     assignment.dateDeRendu = req.body.dateDeRendu;
-    // assignment.rendu = req.body.rendu; // No longer in schema
     assignment.description = req.body.description;
     assignment.userId = req.body.userId;
 
@@ -140,7 +174,6 @@ async function postAssignment(req, res) {
              });
         }
 
-        // Return object with computed rendu for consistency
         const result = savedAssignment.toObject();
         result.rendu = !!req.body.rendu;
 
@@ -161,7 +194,6 @@ async function updateAssignment(req, res) {
         const isRendu = req.body.rendu;
 
         // 1. Update the assignment fields (excluding rendu)
-        // We use {new: true} to get the updated document
         const updatedAssignment = await Assignment.findByIdAndUpdate(
             assignmentId, 
             {
@@ -178,13 +210,12 @@ async function updateAssignment(req, res) {
         }
 
         // 2. Handle Rendu state (Submission table)
+        const targetUserId = userId || updatedAssignment.userId; // Fallback to owner, but ideally client sends ID
+
         if (isRendu) {
-            // Ensure submission exists
-            // We need userId. If not in body, we rely on existing assignment's userId (which we have in updatedAssignment)
-            const targetUserId = userId || updatedAssignment.userId;
             if (targetUserId) {
                 await Submission.updateOne(
-                    { assignmentId: assignmentId },
+                    { assignmentId: assignmentId, userId: targetUserId }, // Match specific user!
                     { 
                         $set: { assignmentId: assignmentId, userId: targetUserId } 
                     },
@@ -192,11 +223,12 @@ async function updateAssignment(req, res) {
                 );
             }
         } else {
-            // Remove submission if it exists
-            await Submission.deleteOne({ assignmentId: assignmentId });
+            // Remove submission for THIS user
+            if (targetUserId) {
+                await Submission.deleteOne({ assignmentId: assignmentId, userId: targetUserId });
+            }
         }
 
-        // 3. Prepare response
         updatedAssignment.rendu = isRendu;
 
         res.json({ message: 'updated', assignment: updatedAssignment });
