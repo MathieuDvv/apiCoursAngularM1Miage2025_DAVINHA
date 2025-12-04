@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: assignment-app-server
+    env: node
+    root: backend
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: MONGO_URI
+        sync: false
