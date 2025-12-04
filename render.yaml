@@ -2,7 +2,7 @@ services:
   - type: web
     name: assignment-app-server
     env: node
-    root: backend
+    rootDir: backend
     buildCommand: npm install
     startCommand: npm start
     envVars:
