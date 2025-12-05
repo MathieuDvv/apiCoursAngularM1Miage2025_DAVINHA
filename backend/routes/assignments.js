@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Assignment = require('../model/assignment');
 const Submission = require('../model/submission');
 
